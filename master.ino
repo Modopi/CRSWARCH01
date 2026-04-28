@@ -1,5 +1,6 @@
 #include <SoftwareSerial.h>
- 
+
+//zs 040 호환보드가 마스터
 SoftwareSerial hc06(2,3);
  
 void setup(){
