@@ -5,6 +5,7 @@
 SoftwareSerial hc06(2, 3);  // RX, TX
 
 const uint8_t MPU_ADDR = 0x68;
+const uint8_t LIGHT_PIN = A0;   // 조도 센서 (CDS)
 
 void mpuWrite(uint8_t reg, uint8_t data) {
   Wire.beginTransmission(MPU_ADDR);
@@ -55,19 +56,23 @@ void loop() {
   float gy = combine(buf[10], buf[11]) / 131.0;
   float gz = combine(buf[12], buf[13]) / 131.0;
 
+  // --- 조도 센서 읽기 (0~1023) ---
+  int light = analogRead(LIGHT_PIN);
+
   // --- 블루투스로 전송 (CSV 형식) ---
-  // 형식: ax,ay,az,gx,gy,gz,temp\n
-  char line[80];
+  // 형식: ax,ay,az,gx,gy,gz,temp,light\n
+  char line[96];
   dtostrf(ax, 1, 3, line);
   strcat(line, ",");
-  char tmp[10];
+  char tmp[12];
 
   dtostrf(ay, 1, 3, tmp); strcat(line, tmp); strcat(line, ",");
   dtostrf(az, 1, 3, tmp); strcat(line, tmp); strcat(line, ",");
   dtostrf(gx, 1, 2, tmp); strcat(line, tmp); strcat(line, ",");
   dtostrf(gy, 1, 2, tmp); strcat(line, tmp); strcat(line, ",");
   dtostrf(gz, 1, 2, tmp); strcat(line, tmp); strcat(line, ",");
-  dtostrf(temp, 1, 1, tmp); strcat(line, tmp);
+  dtostrf(temp, 1, 1, tmp); strcat(line, tmp); strcat(line, ",");
+  itoa(light, tmp, 10); strcat(line, tmp);
 
   hc06.println(line);     // 블루투스로 송신
   Serial.println(line);   // 디버깅용 시리얼 모니터
