@@ -18,13 +18,19 @@ unsigned long rfidHighUntil = 0;
 // ── 파라미터 ──
 const float HEAD_MASS    = 6.0;    // 머리+헬멧 추정 질량 (kg)
 const float G            = 9.807;  // m/s²
-const float IMPACT_THRESH = 16;   // 충격 판정 임계 (g)
+const float IMPACT_THRESH = 2;     // 충격 판정 임계 — 수평 선형가속도 (g)
 
 // ── 이전 프레임 기억 ──
-float prevAx = 0, prevAy = 0, prevAz = 1.0;  // 이전 가속도 (g)
-float prevMag = 1.0;                           // 이전 가속도 크기
+float prevHx = 0, prevHy = 0, prevHz = 0;  // 이전 수평 선형가속도 (g)
 unsigned long prevTime = 0;
 bool firstFrame = true;
+
+// ── 중력 벡터 추정 (상보 필터, 센서 프레임 기준, g 단위) ──
+//  자이로로 중력 방향을 회전시켜 예측하고, 가속도로 저주파 보정.
+//  헬멧이 회전/기울어져도 중력 방향을 따라가므로 "z축=중력" 가정에 의존하지 않음.
+float gravX = 0, gravY = 0, gravZ = 1.0;
+const float COMP_ALPHA = 0.98;       // 자이로 예측 신뢰 비중 (나머지는 가속도 보정)
+const float DEG2RAD    = 0.0174532925f;
 
 // ── 피크 추적 ──
 float peakG = 0;
@@ -43,8 +49,8 @@ bool parseCSV(const String &line, float *vals, int count) {
 }
 
 void setup() {
-  Serial.begin(9600);
-  hc06.begin(9600);
+  Serial.begin(115200);   // USB → PC(TUI). 하드웨어 UART라 115200 안정 (긴 줄 블로킹 최소화)
+  hc06.begin(38400);      // BT ← slave. SoftwareSerial 안정 상한 = 38400
   prevTime = millis();
 
   // RFID 초기화
@@ -63,8 +69,9 @@ void setup() {
 
   // 헤더 — TUI는 "IMU,"로 시작하지 않는 줄을 무시함
   Serial.println(F("# Smart Helmet Impact Monitor — CSV stream"));
-  Serial.println(F("# fields: IMU,ax,ay,az,gx,gy,gz,temp,light,aMag,aNet,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact"));
+  Serial.println(F("# fields: IMU,ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol,aMag,aNet,aHoriz,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact"));
   Serial.println(F("# event:  RFID,<UID_HEX>"));
+  Serial.println(F("# event:  IMPACT,peakG,peakForce,impulse,durMs,peakJerk  (slave 고속 적분 결과)"));
 }
 
 // 카드가 새로 잡혔는지 확인하고, 잡혔으면 HIGH 타이머 갱신
@@ -93,14 +100,25 @@ void loop() {
   line.trim();
   if (line.length() == 0) return;
 
-  // ax, ay, az, gx, gy, gz, temp, light
-  float v[8];
-  if (!parseCSV(line, v, 8)) return;
+  // ── 충격 이벤트 (slave가 고속 적분한 결과) → PC로 그대로 전달 ──
+  //  slave 형식: E,peakG,peakForce,impulse,durMs,peakJerk
+  //  TUI 형식:   IMPACT,peakG,peakForce,impulse,durMs,peakJerk
+  if (line.startsWith("E,")) {
+    Serial.print(F("IMPACT,"));
+    Serial.println(line.substring(2));
+    return;
+  }
+
+  // ax, ay, az, gx, gy, gz, temp, light, fsr, alcohol
+  float v[10];
+  if (!parseCSV(line, v, 10)) return;
 
   float ax = v[0], ay = v[1], az = v[2];   // g
   float gx = v[3], gy = v[4], gz = v[5];   // °/s
   float temp = v[6];                         // °C
-  int   light = (int)v[7];                   // 0..1023 (raw ADC)
+  int   light   = (int)v[7];                 // 0..1023 (raw ADC)
+  int   fsr     = (int)v[8];                 // 0..1023 (raw ADC, FSR402)
+  int   alcohol = (int)v[9];                 // 0..1023 (raw ADC, MQ-3)
 
   unsigned long now = millis();
   float dt = (now - prevTime) / 1000.0;     // 초
@@ -110,41 +128,68 @@ void loop() {
   // ━━━ 1. 가속도 크기 (g) ━━━
   float aMag = sqrt(ax*ax + ay*ay + az*az);
 
-  // ━━━ 2. 순 가속도 — 중력 제거 (g) ━━━
-  float aNet = fabs(aMag - 1.0);
+  // ━━━ 2. 중력 벡터 추정 — 상보 필터 (자이로 회전 예측 + 가속도 보정) ━━━
+  if (firstFrame) {
+    gravX = ax; gravY = ay; gravZ = az;          // 시작 자세로 초기화
+  } else {
+    float wx = gx * DEG2RAD, wy = gy * DEG2RAD, wz = gz * DEG2RAD;  // rad/s
+    // 센서 프레임에서 본 중력은 -ω 로 회전:  g' = g − (ω × g)·dt
+    float gxp = gravX - (wy*gravZ - wz*gravY) * dt;
+    float gyp = gravY - (wz*gravX - wx*gravZ) * dt;
+    float gzp = gravZ - (wx*gravY - wy*gravX) * dt;
+    gravX = COMP_ALPHA*gxp + (1.0f-COMP_ALPHA)*ax;
+    gravY = COMP_ALPHA*gyp + (1.0f-COMP_ALPHA)*ay;
+    gravZ = COMP_ALPHA*gzp + (1.0f-COMP_ALPHA)*az;
+  }
+  float gN = sqrt(gravX*gravX + gravY*gravY + gravZ*gravZ);
+  if (gN < 1e-3) gN = 1.0;
+  float gHx = gravX/gN, gHy = gravY/gN, gHz = gravZ/gN;  // 중력 단위벡터(=지면 법선)
 
-  // ━━━ 3. 충격력 F = m · a_net (N) ━━━
-  float aNet_ms2 = aNet * G;
-  float force = HEAD_MASS * aNet_ms2;
+  // ━━━ 3. 선형 가속도 — 중력 벡터 제거 (g) ━━━
+  float linX = ax - gravX;
+  float linY = ay - gravY;
+  float linZ = az - gravZ;
+  float aNet = sqrt(linX*linX + linY*linY + linZ*linZ);   // 총 선형가속도 크기
 
-  // ━━━ 4. 충격량 J = F · Δt (N·s) ━━━
+  // ━━━ 4. 수평/수직 분해 — 중력 방향 기준 (회전 보정됨) ━━━
+  //  vert  : 중력축 성분 (위아래),  horiz : 지면 평면 성분 (교통사고 등 x,y 충격)
+  float vert = linX*gHx + linY*gHy + linZ*gHz;
+  float hX = linX - vert*gHx;
+  float hY = linY - vert*gHy;
+  float hZ = linZ - vert*gHz;
+  float aHoriz = sqrt(hX*hX + hY*hY + hZ*hZ);
+
+  // ━━━ 5. 충격력 — 수평 성분 기준 F = m · a (N) ━━━
+  float force = HEAD_MASS * aHoriz * G;
+
+  // ━━━ 6. 충격량 J = F · Δt (N·s) ━━━
   float impulse = force * dt;
 
-  // ━━━ 5. 저크 (g/s) — 가속도 변화율 ━━━
+  // ━━━ 7. 저크 (g/s) — 수평 선형가속도 변화율 ━━━
   float jerk = 0;
   if (!firstFrame) {
-    float dAx = ax - prevAx;
-    float dAy = ay - prevAy;
-    float dAz = az - prevAz;
-    jerk = sqrt(dAx*dAx + dAy*dAy + dAz*dAz) / dt;
+    float dHx = hX - prevHx;
+    float dHy = hY - prevHy;
+    float dHz = hZ - prevHz;
+    jerk = sqrt(dHx*dHx + dHy*dHy + dHz*dHz) / dt;
   }
 
-  // ━━━ 6. 자세각 (°) — 가속도 기반 ━━━
-  float roll  = atan2(ay, az) * 180.0 / M_PI;
-  float pitch = atan2(-ax, sqrt(ay*ay + az*az)) * 180.0 / M_PI;
+  // ━━━ 8. 자세각 (°) — 추정 중력 벡터 기준 (회전 안정적) ━━━
+  float roll  = atan2(gravY, gravZ) * 180.0 / M_PI;
+  float pitch = atan2(-gravX, sqrt(gravY*gravY + gravZ*gravZ)) * 180.0 / M_PI;
 
-  // ━━━ 7. 각속도 크기 (°/s) ━━━
+  // ━━━ 9. 각속도 크기 (°/s) ━━━
   float gyroMag = sqrt(gx*gx + gy*gy + gz*gz);
 
   // ━━━ 피크 갱신 ━━━
   if (aMag > peakG)     peakG = aMag;
   if (force > peakForce) peakForce = force;
 
-  // ━━━ 충격 판정 ━━━
-  bool impact = (aMag >= IMPACT_THRESH);
+  // ━━━ 충격 판정 — 수평(x,y) 선형가속도 기준 ━━━
+  bool impact = (aHoriz >= IMPACT_THRESH);
 
   // ━━━━━━ 출력 (CSV, TUI에서 파싱) ━━━━━━
-  // 형식: IMU,ax,ay,az,gx,gy,gz,temp,light,aMag,aNet,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact
+  // 형식: IMU,ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol,aMag,aNet,aHoriz,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact
   Serial.print(F("IMU,"));
   Serial.print(ax, 3);       Serial.print(',');
   Serial.print(ay, 3);       Serial.print(',');
@@ -154,8 +199,11 @@ void loop() {
   Serial.print(gz, 2);       Serial.print(',');
   Serial.print(temp, 1);     Serial.print(',');
   Serial.print(light);       Serial.print(',');
+  Serial.print(fsr);         Serial.print(',');
+  Serial.print(alcohol);     Serial.print(',');
   Serial.print(aMag, 3);     Serial.print(',');
   Serial.print(aNet, 3);     Serial.print(',');
+  Serial.print(aHoriz, 3);   Serial.print(',');
   Serial.print(force, 2);    Serial.print(',');
   Serial.print(impulse, 4);  Serial.print(',');
   Serial.print(jerk, 2);     Serial.print(',');
@@ -167,7 +215,6 @@ void loop() {
   Serial.println(impact ? 1 : 0);
 
   // ── 다음 프레임 준비 ──
-  prevAx = ax; prevAy = ay; prevAz = az;
-  prevMag = aMag;
+  prevHx = hX; prevHy = hY; prevHz = hZ;
   firstFrame = false;
 }

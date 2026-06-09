@@ -13,7 +13,7 @@ master.ino 가 시리얼로 흘려보내는 CSV 스트림을 받아 보기 좋�
 실행:
     uv run monitor/tui.py                       # 시리얼 포트 자동 탐색
     uv run monitor/tui.py --port /dev/cu.usbserial-XXXX
-    uv run monitor/tui.py --port COM5 --baud 9600
+    uv run monitor/tui.py --port COM5 --baud 115200
 
 uv 없으면:
     python3 -m pip install rich pyserial
@@ -43,19 +43,23 @@ from serial.tools import list_ports
 FIELDS = [
     "ax", "ay", "az",
     "gx", "gy", "gz",
-    "temp", "light",
-    "aMag", "aNet",
+    "temp", "light", "fsr", "alcohol",
+    "aMag", "aNet", "aHoriz",
     "force", "impulse", "jerk",
     "roll", "pitch", "gyroMag",
     "peakG", "peakForce",
     "impact",
 ]
 
+# MQ-3 raw ADC 임계값 — 이 값 이상이면 음주 의심 (현장 보정 필요)
+ALCOHOL_THRESHOLD = 500
+
 
 @dataclass
 class State:
     last: dict = field(default_factory=dict)
     history: deque = field(default_factory=lambda: deque(maxlen=120))
+    fsr_history: deque = field(default_factory=lambda: deque(maxlen=120))
     impacts: deque = field(default_factory=lambda: deque(maxlen=10))
     last_update: float = 0.0
     connected: bool = False
@@ -100,6 +104,30 @@ def parse_line(line: str):
     return dict(zip(FIELDS, values))
 
 
+def parse_impact(line: str):
+    """IMPACT,peakG,peakForce,impulse,durMs,peakJerk 파싱.
+
+    slave가 고속(~kHz)으로 적분해 보낸 충격 1건의 결과값. (peakG, peakForce,
+    impulse[N·s], durMs, jerk) 튜플 또는 None.
+    """
+    line = line.strip()
+    if not line.startswith("IMPACT,"):
+        return None
+    parts = line[len("IMPACT,"):].split(",")
+    if len(parts) != 5:
+        return None
+    try:
+        return tuple(float(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def _record_impact(peak_g, peak_f, impulse, dur_ms, jerk) -> None:
+    with state.lock:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        state.impacts.appendleft((stamp, peak_g, peak_f, impulse, dur_ms, jerk))
+
+
 def parse_rfid(line: str) -> str | None:
     """RFID,<UID_HEX> 라인을 파싱. UID 문자열(대문자) 또는 None."""
     line = line.strip()
@@ -136,6 +164,10 @@ def reader_thread(port: str, baud: int) -> None:
                     if uid is not None:
                         _record_rfid(uid)
                         continue
+                    ev = parse_impact(line)
+                    if ev is not None:
+                        _record_impact(*ev)
+                        continue
                     data = parse_line(line)
                     if data is None:
                         if line.strip() and not line.strip().startswith("#"):
@@ -145,13 +177,11 @@ def reader_thread(port: str, baud: int) -> None:
                     with state.lock:
                         state.last = data
                         state.history.append(data["aMag"])
+                        state.fsr_history.append(data["fsr"])
                         state.last_update = time.time()
                         state.frames += 1
-                        if data["impact"] >= 0.5:
-                            stamp = datetime.now().strftime("%H:%M:%S")
-                            state.impacts.appendleft(
-                                (stamp, data["aMag"], data["force"])
-                            )
+                        # 충격 로그는 slave가 보내는 정확한 IMPACT 이벤트로만 채운다
+                        # (10Hz 상태 프레임의 impact 플래그는 적분값이 없어 사용 안 함)
         except (serial.SerialException, OSError):
             with state.lock:
                 state.connected = False
@@ -190,24 +220,30 @@ def demo_thread() -> None:
             next_impact = time.time() + random.uniform(4, 9)
 
         a_mag = math.sqrt(ax * ax + ay * ay + az * az)
-        a_net = abs(a_mag - 1.0)
-        force = 5.0 * a_net * 9.807
+        # 데모: 중력은 z축에 있다고 보고 수평 성분 ≈ sqrt(ax²+ay²)
+        a_horiz = math.sqrt(ax * ax + ay * ay)
+        a_net = math.sqrt(ax * ax + ay * ay + (az - 1.0) ** 2)
+        force = 6.0 * a_horiz * 9.807
         impulse = force * 0.1
-        jerk = random.uniform(0, 5) + (50 if a_mag > 2.5 else 0)
+        jerk = random.uniform(0, 5) + (50 if a_horiz > 1.5 else 0)
         roll = math.atan2(ay, az) * 180 / math.pi
         pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az)) * 180 / math.pi
         gyro_mag = math.sqrt(gx * gx + gy * gy + gz * gz)
         peak_g = max(peak_g, a_mag)
         peak_f = max(peak_f, force)
-        impact = 1.0 if a_mag >= 2.5 else 0.0
+        impact = 1.0 if a_horiz >= 1.5 else 0.0
 
         light = int(max(0, min(1023, 500 + 300 * math.sin(t / 7) + random.gauss(0, 20))))
+        fsr = int(max(0, min(1023, 400 + 350 * math.sin(t / 3) + random.gauss(0, 30))))
+        alcohol = int(max(0, min(1023, 300 + 250 * math.sin(t / 11) + random.gauss(0, 25))))
         data = {
             "ax": ax, "ay": ay, "az": az,
             "gx": gx, "gy": gy, "gz": gz,
             "temp": 24.0 + 0.3 * math.sin(t / 30),
             "light": light,
-            "aMag": a_mag, "aNet": a_net,
+            "fsr": fsr,
+            "alcohol": alcohol,
+            "aMag": a_mag, "aNet": a_net, "aHoriz": a_horiz,
             "force": force, "impulse": impulse, "jerk": jerk,
             "roll": roll, "pitch": pitch, "gyroMag": gyro_mag,
             "peakG": peak_g, "peakForce": peak_f,
@@ -216,11 +252,15 @@ def demo_thread() -> None:
         with state.lock:
             state.last = data
             state.history.append(a_mag)
+            state.fsr_history.append(float(fsr))
             state.last_update = time.time()
             state.frames += 1
             if impact >= 0.5:
                 stamp = datetime.now().strftime("%H:%M:%S")
-                state.impacts.appendleft((stamp, a_mag, force))
+                # 데모: slave 이벤트 형식과 맞춰 (peakG, peakF, impulse, durMs, jerk)
+                state.impacts.appendleft(
+                    (stamp, a_mag, force, force * 0.02, 20.0, jerk)
+                )
         if time.time() >= next_rfid:
             _record_rfid(random.choice(demo_uids))
             next_rfid = time.time() + random.uniform(6, 12)
@@ -281,6 +321,24 @@ def sparkline(values, width: int = 80) -> str:
     return "".join(out)
 
 
+def sparkline_scaled(values, lo: float, hi: float, width: int = 80) -> str:
+    """고정 범위(lo~hi) 스파크라인. raw ADC 같은 0~1023 값에 사용."""
+    blocks = "▁▂▃▄▅▆▇█"
+    data = list(values)[-width:]
+    if len(data) < width:
+        data = ["·"] * (width - len(data)) + data
+    span = (hi - lo) or 1.0
+    out = []
+    for v in data:
+        if isinstance(v, str):
+            out.append(" ")
+            continue
+        idx = int((v - lo) / span * (len(blocks) - 1))
+        idx = max(0, min(len(blocks) - 1, idx))
+        out.append(blocks[idx])
+    return "".join(out)
+
+
 def header_panel() -> Panel:
     with state.lock:
         connected = state.connected
@@ -313,8 +371,11 @@ def accel_panel(d) -> Panel:
         t.add_row("", "", "")
         a_mag = d["aMag"]
         net = d["aNet"]
+        horiz = d.get("aHoriz", 0.0)
         mag_color = "red" if a_mag > 2.5 else "yellow" if a_mag > 1.5 else "white"
+        h_color = "red" if horiz > 2.5 else "yellow" if horiz > 1.5 else "white"
         t.add_row("|a|", f"[bold {mag_color}]{a_mag:.3f} g[/]", f"net [bold]{net:.3f}[/] g")
+        t.add_row("h|a|", f"[bold {h_color}]{horiz:.3f} g[/]", "x,y 충격 (중력제거)")
     else:
         t.add_row("--", "no data", "")
     return Panel(t, title="[bold]Acceleration[/]", border_style="blue")
@@ -327,10 +388,11 @@ def impact_panel(d) -> Panel:
     if d:
         f_val = d["force"]
         f_color = "red" if f_val > 100 else "yellow" if f_val > 30 else "white"
+        t.add_row("Horiz a", f"{d.get('aHoriz', 0.0):9.3f} g")
         t.add_row("Force",   f"[{f_color}]{f_val:9.2f} N[/]")
         t.add_row("Impulse", f"{d['impulse']:9.4f} N·s")
         t.add_row("Jerk",    f"{d['jerk']:9.2f} g/s")
-    return Panel(t, title="[bold magenta]Impact metrics[/]", border_style="magenta")
+    return Panel(t, title="[bold magenta]Impact metrics[/] [dim](x,y)[/]", border_style="magenta")
 
 
 def orient_panel(d) -> Panel:
@@ -365,6 +427,17 @@ def status_panel(d) -> Panel:
         lux_pct = max(0.0, min(1.0, lux / 1023.0)) * 100
         lux_color = "bright_yellow" if lux_pct > 60 else "yellow" if lux_pct > 25 else "dim"
         t.add_row("Light",    f"[{lux_color}]{int(lux):4d} ({lux_pct:5.1f}%)[/]")
+        fsr = d.get("fsr", 0)
+        fsr_pct = max(0.0, min(1.0, fsr / 1023.0)) * 100
+        fsr_color = "bright_red" if fsr_pct > 60 else "yellow" if fsr_pct > 20 else "dim"
+        t.add_row("Pressure", f"[{fsr_color}]{int(fsr):4d} ({fsr_pct:5.1f}%)[/]")
+        alc = d.get("alcohol", 0)
+        alc_pct = max(0.0, min(1.0, alc / 1023.0)) * 100
+        if alc >= ALCOHOL_THRESHOLD:
+            t.add_row("Alcohol", f"[bold white on red] DRUNK [/] [red]{int(alc):4d} ({alc_pct:5.1f}%)[/]")
+        else:
+            alc_color = "yellow" if alc_pct > 30 else "dim"
+            t.add_row("Alcohol", f"[{alc_color}]{int(alc):4d} ({alc_pct:5.1f}%)[/]")
         t.add_row("Peak |a|", f"[bold red]{d['peakG']:.3f} g[/]")
         t.add_row("Peak F",   f"[bold red]{d['peakForce']:.1f} N[/]")
     with state.lock:
@@ -403,6 +476,23 @@ def history_panel() -> Panel:
     return Panel(body, title="[bold]|a| history[/]  (recent samples)", border_style="blue")
 
 
+def pressure_history_panel() -> Panel:
+    with state.lock:
+        vals = list(state.fsr_history)
+    spark = sparkline_scaled(vals, lo=0, hi=1023, width=78)
+    nums = [v for v in vals if isinstance(v, float)]
+    if nums:
+        cur = nums[-1]
+        info = f"  now {int(cur):4d}    min {int(min(nums)):4d}    max {int(max(nums)):4d}    n={len(nums)}"
+    else:
+        info = "  (waiting for data)"
+    body = Group(
+        Text(spark, style="bright_red"),
+        Text(info, style="dim"),
+    )
+    return Panel(body, title="[bold]Pressure history[/]  (FSR raw 0–1023)", border_style="red")
+
+
 def impact_log_panel() -> Panel:
     with state.lock:
         rows = list(state.impacts)
@@ -410,11 +500,19 @@ def impact_log_panel() -> Panel:
     t.add_column(style="dim", width=10)
     t.add_column(style="bold red")
     t.add_column(justify="right", style="red")
+    t.add_column(justify="right", style="bold yellow")
+    t.add_column(justify="right", style="dim")
     if not rows:
-        t.add_row("--:--:--", "(no impacts yet)", "")
-    for ts, g, f_val in rows:
-        t.add_row(ts, f"⚠ {g:.2f} g", f"{f_val:.1f} N")
-    return Panel(t, title="[bold red]Impact log[/]", border_style="red")
+        t.add_row("--:--:--", "(no impacts yet)", "", "", "")
+    for ts, g, f_val, impulse, dur_ms, _jerk in rows:
+        t.add_row(
+            ts,
+            f"⚠ {g:.2f} g",
+            f"{f_val:.0f} N",
+            f"J {impulse:.3f} N·s",
+            f"{dur_ms:.0f} ms",
+        )
+    return Panel(t, title="[bold red]Impact log[/]  [dim](slave 고속 적분 J=∫F·dt)[/]", border_style="red")
 
 
 def render() -> Layout:
@@ -426,6 +524,7 @@ def render() -> Layout:
         Layout(header_panel(), name="header", size=3),
         Layout(name="body"),
         Layout(history_panel(), name="hist", size=5),
+        Layout(pressure_history_panel(), name="phist", size=5),
         Layout(name="footer", size=9),
     )
     layout["body"].split_row(
@@ -450,7 +549,7 @@ def render() -> Layout:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Smart Helmet TUI monitor")
     ap.add_argument("--port", help="시리얼 포트 (생략 시 자동 탐색)")
-    ap.add_argument("--baud", type=int, default=9600)
+    ap.add_argument("--baud", type=int, default=115200)  # master USB = 115200
     ap.add_argument("--list", action="store_true", help="감지된 시리얼 포트 목록만 보고 종료")
     ap.add_argument("--demo", action="store_true", help="가짜 데이터로 TUI 동작 확인 (시리얼 미사용)")
     ap.add_argument("--raw", action="store_true", help="TUI 대신 시리얼 raw 출력 (디버그용)")
