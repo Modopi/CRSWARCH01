@@ -1,19 +1,64 @@
 #include <SoftwareSerial.h>
-#include <SPI.h>
-#include <MFRC522.h>
 #include <math.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
 
 //zs 040
 SoftwareSerial hc06(2, 3);
 
-// ── RFID (MFRC522) ──
-// 결선: SDA→D10, SCK→D13, MOSI→D11, MISO→D12, RST→D9, 3.3V, GND  (IRQ 미사용)
-const uint8_t RFID_SS_PIN     = 10;
-const uint8_t RFID_RST_PIN    = 9;
-const uint8_t RFID_SIGNAL_PIN = 4;       // 카드 인식 시 HIGH 출력
-const unsigned long RFID_HOLD_MS = 2000; // 인식 후 HIGH 유지 시간 (ms)
-MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
-unsigned long rfidHighUntil = 0;
+// ── 2× I2C 16x2 LCD (드라이버 백팩) ──
+//  같은 I2C 버스(A4=SDA, A5=SCL) 공유 → 주소가 서로 달라야 함.
+//  I2C 스캐너로 실제 주소 확인 후 아래 값 맞추기.
+#define LCD_LABEL_ADDR 0x27       // 라벨 LCD (버튼 기능 표시)
+#define LCD_INFO_ADDR  0x26       // 정보 LCD (라이브 값) — A0 점퍼 단락으로 0x27→0x26
+LiquidCrystal_I2C lcdLabel(LCD_LABEL_ADDR, 16, 2);
+LiquidCrystal_I2C lcdInfo (LCD_INFO_ADDR,  16, 2);
+
+// ── 4x4 키패드 (상단 8키만 사용, 나머지는 가림) ──
+//  Row=D5~D8, Col=A0~A3(디지털). BT(D2,D3)/I2C(A4,A5) 핀과 충돌 없음.
+const byte KP_ROWS = 4, KP_COLS = 4;
+char keymap[KP_ROWS][KP_COLS] = {
+  {'1','2','3','A'},   // 1,2,3 사용 / A 가림
+  {'4','5','6','B'},   // 4,5,6 사용 / B 가림
+  {'7','8','9','C'},   // 7,8 사용 / 9,C 가림
+  {'*','0','#','D'},   // 전부 가림 (오버레이로 1~8만 노출)
+};
+byte rowPins[KP_ROWS] = {5, 6, 7, 8};
+byte colPins[KP_COLS] = {A0, A1, A2, A3};
+Keypad keypad = Keypad(makeKeymap(keymap), rowPins, colPins, KP_ROWS, KP_COLS);
+
+// ── 실제 사용하는 8키 (배선: col3·col4, S4가 맨 위) ──
+//  세로 분리 배치: 기능1~4 = col3(S3,S7,S11,S15), 기능5~8 = col4(S4,S8,S12,S16).
+//  오버레이에 1~8로 라벨링 → LCD 범례의 숫자와 일치.
+#define BTN1 '3'   // col3 row1 (S3)
+#define BTN2 '6'   // col3 row2 (S7)
+#define BTN3 '9'   // col3 row3 (S11)
+#define BTN4 '#'   // col3 row4 (S15)
+#define BTN5 'A'   // col4 row1 (S4, 맨 위)
+#define BTN6 'B'   // col4 row2 (S8)
+#define BTN7 'C'   // col4 row3 (S12)
+#define BTN8 'D'   // col4 row4 (S16)
+
+// ── UI 상태 ──
+//  화면 모드: HOME(릴레이 제어) ↔ SENSOR(센서 상세). 키패드 기능이 모드별로 달라짐.
+enum UiMode { MODE_HOME = 0, MODE_SENSOR = 1 };
+uint8_t uiMode    = MODE_HOME;
+uint8_t relayMode = 2;            // master가 명령하는 모드 (0=OFF,1=ON,2=AUTO)
+uint8_t sensorSel = 0;            // SENSOR 모드 선택: 0=조도 1=알콜 2=압력 3=가속도
+uint8_t scrollRow = 0;            // SENSOR 상세 스크롤 시작 줄
+bool    freeze    = false;        // 화면 정지(Hold) — 값 갱신 멈춤
+bool    lcdDirty  = true;
+unsigned long lastHeartbeat = 0;
+unsigned long lastLcdRefresh = 0;
+const unsigned long HEARTBEAT_MS  = 1000;  // 릴레이 모드 재전송 주기
+const unsigned long LCD_REFRESH_MS = 250;  // 정보 LCD 갱신 상한 (4Hz, I2C 느림)
+
+// ── LCD 표시용 최신값 ──
+float dispTemp = 0, dispPeakG = 0, dispPeakF = 0;
+float dispAMag = 0, dispAHoriz = 0, dispForce = 0, dispRoll = 0, dispPitch = 0;
+int   dispLight = 0, dispFsr = 0, dispAlcohol = 0;
+uint8_t slaveRelayMode = 2, slaveRelayState = 0;   // slave가 보고한 실제 상태
 
 // ── 파라미터 ──
 const float HEAD_MASS    = 6.0;    // 머리+헬멧 추정 질량 (kg)
@@ -48,51 +93,162 @@ bool parseCSV(const String &line, float *vals, int count) {
   return idx == count;
 }
 
+// ── 릴레이 모드 명령 송신 (R,<mode>\n) ──
+void sendRelayCmd() {
+  hc06.print('R');
+  hc06.print(',');
+  hc06.println(relayMode);
+}
+
+// LCD 한 줄을 16칸으로 패딩해 출력 (이전 잔상 제거)
+void lcdLine(LiquidCrystal_I2C &lcd, uint8_t row, const char *s) {
+  char buf[17];
+  uint8_t i = 0;
+  for (; i < 16 && s[i]; i++) buf[i] = s[i];
+  for (; i < 16; i++) buf[i] = ' ';
+  buf[16] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+// 라벨 LCD — 현재 모드에 맞는 버튼 범례 출력 (모드/Hold 바뀔 때만 호출)
+void setLabelForMode() {
+  if (uiMode == MODE_SENSOR) {
+    lcdLine(lcdLabel, 0, "1LT 2AL 3PR 4AC");
+    lcdLine(lcdLabel, 1, freeze ? "5Exit 6HELD 7v8^" : "5Exit 6Hold 7v8^");
+  } else {
+    lcdLine(lcdLabel, 0, "1AUTO 2OFF 3ON");
+    lcdLine(lcdLabel, 1, "4:SENSOR MODE");
+  }
+}
+
+// SENSOR 상세 줄 목록 생성 (선택 센서별, 라이브 값). 줄 수 반환.
+uint8_t buildSensorLines(char lines[][17]) {
+  char a[12];
+  uint8_t n = 0;
+  switch (sensorSel) {
+    case 0:  // 조도 (CDS)
+      snprintf(lines[n++], 17, "Light  raw%4d", dispLight);
+      dtostrf(dispLight * 100.0 / 1023.0, 1, 1, a);
+      snprintf(lines[n++], 17, "pct  %s %%", a);
+      snprintf(lines[n++], 17, "th <550=>ON");
+      snprintf(lines[n++], 17, "now  %s", dispLight < 550 ? "DARK" : "BRIGHT");
+      break;
+    case 1:  // 알콜 (MQ-3)
+      snprintf(lines[n++], 17, "Alcohol raw%4d", dispAlcohol);
+      dtostrf(dispAlcohol * 100.0 / 1023.0, 1, 1, a);
+      snprintf(lines[n++], 17, "pct  %s %%", a);
+      snprintf(lines[n++], 17, "th >500 DRUNK");
+      snprintf(lines[n++], 17, "now  %s", dispAlcohol >= 500 ? "DRUNK" : "OK");
+      break;
+    case 2:  // 압력 (FSR402)
+      snprintf(lines[n++], 17, "Press  raw%4d", dispFsr);
+      dtostrf(dispFsr * 100.0 / 1023.0, 1, 1, a);
+      snprintf(lines[n++], 17, "pct  %s %%", a);
+      snprintf(lines[n++], 17, "state %s",
+               dispFsr < 100 ? "NONE" : dispFsr < 500 ? "LIGHT" : "FIRM");
+      break;
+    default: // 가속도 (MPU-6050) — 현재값 + 피크
+      dtostrf(dispAMag, 1, 2, a);   snprintf(lines[n++], 17, "aMag  %s g", a);
+      dtostrf(dispAHoriz, 1, 2, a); snprintf(lines[n++], 17, "aHoriz %s g", a);
+      dtostrf(dispForce, 1, 0, a);  snprintf(lines[n++], 17, "Force %s N", a);   // 현재 충격력
+      dtostrf(dispPeakG, 1, 2, a);  snprintf(lines[n++], 17, "peakG %s g", a);   // 피크
+      dtostrf(dispPeakF, 1, 0, a);  snprintf(lines[n++], 17, "peakF %s N", a);   // 피크 충격력
+      dtostrf(dispRoll, 1, 0, a);   snprintf(lines[n++], 17, "roll  %s deg", a);
+      dtostrf(dispPitch, 1, 0, a);  snprintf(lines[n++], 17, "pitch %s deg", a);
+      break;
+  }
+  return n;
+}
+
+// 정보 LCD 갱신 — 모드별 분기
+void updateInfoLcd() {
+  if (uiMode == MODE_SENSOR) {
+    char lines[8][17];
+    uint8_t n = buildSensorLines(lines);
+    if (scrollRow >= n) scrollRow = n - 1;            // 스크롤 범위 클램프
+    lcdLine(lcdInfo, 0, lines[scrollRow]);
+    lcdLine(lcdInfo, 1, (scrollRow + 1 < n) ? lines[scrollRow + 1] : "");
+    return;
+  }
+  // HOME: 0행 릴레이 상태, 1행 피크 + 센서모드 안내
+  char l0[20], l1[20], a[10];
+  const char *mn = (slaveRelayMode == 2) ? "AUTO" : (slaveRelayMode == 1) ? "ON  " : "OFF ";
+  const char *rs = slaveRelayState ? "ON " : "OFF";
+  snprintf(l0, sizeof(l0), "Relay %s [%s]", mn, rs);
+  dtostrf(dispPeakG, 1, 1, a);
+  snprintf(l1, sizeof(l1), "Pk %sg   4=SENS", a);
+  lcdLine(lcdInfo, 0, l0);
+  lcdLine(lcdInfo, 1, l1);
+}
+
+// 키패드 입력 — 현재 모드에 따라 의미가 달라짐 (사용 키 BTN1~BTN8)
+void handleKey(char k) {
+  if (uiMode == MODE_SENSOR) {
+    switch (k) {
+      case BTN1: sensorSel = 0; scrollRow = 0; lcdDirty = true; break;  // 조도
+      case BTN2: sensorSel = 1; scrollRow = 0; lcdDirty = true; break;  // 알콜
+      case BTN3: sensorSel = 2; scrollRow = 0; lcdDirty = true; break;  // 압력
+      case BTN4: sensorSel = 3; scrollRow = 0; lcdDirty = true; break;  // 가속도
+      case BTN5: uiMode = MODE_HOME; freeze = false;                    // 모드 종료
+                 setLabelForMode(); lcdDirty = true; break;
+      case BTN6: freeze = !freeze; setLabelForMode(); lcdDirty = true; break;  // Hold
+      case BTN7: scrollRow++;  lcdDirty = true; break;                  // 다음 줄
+      case BTN8: if (scrollRow > 0) scrollRow--; lcdDirty = true; break;// 이전 줄
+      default:   break;
+    }
+    return;
+  }
+  // HOME
+  switch (k) {
+    case BTN1: relayMode = 2; sendRelayCmd(); lcdDirty = true; break;  // AUTO
+    case BTN2: relayMode = 0; sendRelayCmd(); lcdDirty = true; break;  // OFF
+    case BTN3: relayMode = 1; sendRelayCmd(); lcdDirty = true; break;  // ON
+    case BTN4: uiMode = MODE_SENSOR; sensorSel = 0; scrollRow = 0;     // 센서모드 진입
+               setLabelForMode(); lcdDirty = true; break;
+    default:   break;
+  }
+}
+
 void setup() {
   Serial.begin(115200);   // USB → PC(TUI). 하드웨어 UART라 115200 안정 (긴 줄 블로킹 최소화)
   hc06.begin(38400);      // BT ← slave. SoftwareSerial 안정 상한 = 38400
   prevTime = millis();
 
-  // RFID 초기화
-  SPI.begin();
-  rfid.PCD_Init();
-  rfid.PCD_SetAntennaGain(rfid.RxGain_max);  // 안테나 게인 최대
-  rfid.PCD_AntennaOn();                       // 명시적으로 한번 더 ON
-  pinMode(RFID_SIGNAL_PIN, OUTPUT);
-  digitalWrite(RFID_SIGNAL_PIN, LOW);
-
-  // 진단: RC522 펌웨어 버전 출력 (정상=0x91/0x92, 비정상=0x00/0xFF)
-  Serial.print(F("# RC522 ver: "));
-  byte v = rfid.PCD_ReadRegister(MFRC522::VersionReg);
-  Serial.println(v, HEX);
-  rfid.PCD_DumpVersionToSerial();
+  // LCD 초기화 — 라벨 LCD는 현재 모드의 버튼 범례 표시
+  Wire.begin();
+  lcdLabel.init(); lcdLabel.backlight();
+  lcdInfo.init();  lcdInfo.backlight();
+  setLabelForMode();      // HOME 범례
+  lcdLine(lcdInfo,  0, "Relay AUTO [OFF]");
+  lcdLine(lcdInfo,  1, "  waiting BT...");
+  sendRelayCmd();         // 초기 모드(AUTO) 동기화
 
   // 헤더 — TUI는 "IMU,"로 시작하지 않는 줄을 무시함
   Serial.println(F("# Smart Helmet Impact Monitor — CSV stream"));
-  Serial.println(F("# fields: IMU,ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol,aMag,aNet,aHoriz,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact"));
-  Serial.println(F("# event:  RFID,<UID_HEX>"));
+  Serial.println(F("# fields: IMU,ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol,aMag,aNet,aHoriz,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact,relayMode,relayState"));
   Serial.println(F("# event:  IMPACT,peakG,peakForce,impulse,durMs,peakJerk  (slave 고속 적분 결과)"));
 }
 
-// 카드가 새로 잡혔는지 확인하고, 잡혔으면 HIGH 타이머 갱신
-// 출력 형식: RFID,<UID_HEX>\n   (TUI에서 파싱)
-void pollRFID() {
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    rfidHighUntil = millis() + RFID_HOLD_MS;
-    Serial.print(F("RFID,"));
-    for (byte i = 0; i < rfid.uid.size; i++) {
-      if (rfid.uid.uidByte[i] < 0x10) Serial.print('0');
-      Serial.print(rfid.uid.uidByte[i], HEX);
-    }
-    Serial.println();
-    rfid.PICC_HaltA();
-  }
-  digitalWrite(RFID_SIGNAL_PIN, (millis() < rfidHighUntil) ? HIGH : LOW);
-}
-
 void loop() {
-  // RFID는 매 루프 폴링 (BT 데이터 유무와 무관)
-  pollRFID();
+  // ── 키패드 입력 ──
+  char k = keypad.getKey();
+  if (k) handleKey(k);
+
+  unsigned long uiNow = millis();
+
+  // ── 릴레이 모드 하트비트 (1s) — 드롭된 명령 자동 복구 ──
+  if (uiNow - lastHeartbeat >= HEARTBEAT_MS) {
+    lastHeartbeat = uiNow;
+    sendRelayCmd();
+  }
+
+  // ── 정보 LCD 갱신 (4Hz 상한, I2C가 느려 BT 스트림 블로킹 최소화) ──
+  if (lcdDirty && uiNow - lastLcdRefresh >= LCD_REFRESH_MS) {
+    lastLcdRefresh = uiNow;
+    lcdDirty = false;
+    updateInfoLcd();
+  }
 
   if (!hc06.available()) return;
 
@@ -109,9 +265,9 @@ void loop() {
     return;
   }
 
-  // ax, ay, az, gx, gy, gz, temp, light, fsr, alcohol
-  float v[10];
-  if (!parseCSV(line, v, 10)) return;
+  // ax, ay, az, gx, gy, gz, temp, light, fsr, alcohol, relayMode, relayState
+  float v[12];
+  if (!parseCSV(line, v, 12)) return;
 
   float ax = v[0], ay = v[1], az = v[2];   // g
   float gx = v[3], gy = v[4], gz = v[5];   // °/s
@@ -119,6 +275,8 @@ void loop() {
   int   light   = (int)v[7];                 // 0..1023 (raw ADC)
   int   fsr     = (int)v[8];                 // 0..1023 (raw ADC, FSR402)
   int   alcohol = (int)v[9];                 // 0..1023 (raw ADC, MQ-3)
+  int   relayModeRpt  = (int)v[10];          // slave가 적용 중인 모드 (0/1/2)
+  int   relayStateRpt = (int)v[11];          // slave 실제 릴레이 출력 (0/1)
 
   unsigned long now = millis();
   float dt = (now - prevTime) / 1000.0;     // 초
@@ -188,6 +346,16 @@ void loop() {
   // ━━━ 충격 판정 — 수평(x,y) 선형가속도 기준 ━━━
   bool impact = (aHoriz >= IMPACT_THRESH);
 
+  // ━━━ LCD 표시값 갱신 (실제 쓰기는 loop의 4Hz throttle에서) ━━━
+  //  Hold(freeze)면 값 갱신을 멈춰 화면을 고정 — 단 릴레이 상태는 항상 추종.
+  slaveRelayMode = relayModeRpt; slaveRelayState = relayStateRpt;
+  if (!freeze) {
+    dispTemp = temp; dispLight = light; dispFsr = fsr; dispAlcohol = alcohol;
+    dispPeakG = peakG; dispPeakF = peakForce;
+    dispAMag = aMag; dispAHoriz = aHoriz; dispForce = force; dispRoll = roll; dispPitch = pitch;
+    lcdDirty = true;
+  }
+
   // ━━━━━━ 출력 (CSV, TUI에서 파싱) ━━━━━━
   // 형식: IMU,ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol,aMag,aNet,aHoriz,force,impulse,jerk,roll,pitch,gyroMag,peakG,peakForce,impact
   Serial.print(F("IMU,"));
@@ -212,7 +380,9 @@ void loop() {
   Serial.print(gyroMag, 1);  Serial.print(',');
   Serial.print(peakG, 3);    Serial.print(',');
   Serial.print(peakForce, 1); Serial.print(',');
-  Serial.println(impact ? 1 : 0);
+  Serial.print(impact ? 1 : 0); Serial.print(',');
+  Serial.print(relayModeRpt);  Serial.print(',');
+  Serial.println(relayStateRpt);
 
   // ── 다음 프레임 준비 ──
   prevHx = hX; prevHy = hY; prevHz = hZ;

@@ -7,6 +7,14 @@ SoftwareSerial hc06(2, 3);  // RX, TX
 const int RELAY_PIN = 7;        // 릴레이 출력
 const int LIGHT_THRESHOLD = 550; // 이 값 미만이면 릴레이 ON
 
+// ── 릴레이 제어 모드 (master가 BT로 설정) ──
+//  0=OFF(강제 끔), 1=ON(강제 켬), 2=AUTO(조도 자동). 기본 AUTO.
+//  모듈은 active-LOW: 릴레이 ON일 때 핀 LOW 출력.
+uint8_t relayMode  = 2;         // 현재 적용 중인 모드
+uint8_t relayState = 0;         // 실제 릴레이 출력 (1=ON)
+char    cmdBuf[8];              // master→slave 명령 수신 버퍼 ("R,2")
+uint8_t cmdLen = 0;
+
 
 const uint8_t MPU_ADDR = 0x68;
 const uint8_t LIGHT_PIN = A0;   // 조도 센서 (CDS)
@@ -189,6 +197,22 @@ void processSample(float ax, float ay, float az, float gx, float gy, float gz) {
 }
 
 void loop() {
+  // ━━━ master→slave 명령 수신 (R,<mode>\n) — 릴레이 모드 설정 ━━━
+  //  하트비트로 1초마다 재전송되므로 SoftwareSerial TX 중 바이트를 흘려도 곧 복구됨.
+  while (hc06.available()) {
+    char c = hc06.read();
+    if (c == '\n' || c == '\r') {
+      cmdBuf[cmdLen] = '\0';
+      if (cmdLen >= 3 && cmdBuf[0] == 'R' && cmdBuf[1] == ',') {
+        uint8_t m = cmdBuf[2] - '0';
+        if (m <= 2) relayMode = m;
+      }
+      cmdLen = 0;
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
+    }
+  }
+
   // ━━━ FIFO 드레인 — 쌓인 샘플 전부 처리 (전송 블랙아웃 동안 것도 회수) ━━━
   uint16_t count = fifoCount();
   if (count >= FIFO_HIGH) {       // 오버플로 직전 → 리셋 (정렬 깨짐 방지)
@@ -223,11 +247,14 @@ void loop() {
     float temp = combine(tb[0], tb[1]) / 340.0 + 36.53;
 
     int light = analogRead(LIGHT_PIN);
-    digitalWrite(RELAY_PIN, light < LIGHT_THRESHOLD ? LOW : HIGH);
+    // 릴레이: AUTO=조도 자동(어두우면 ON), ON/OFF=강제. (모듈 active-LOW)
+    bool relayOn = (relayMode == 2) ? (light < LIGHT_THRESHOLD) : (relayMode == 1);
+    digitalWrite(RELAY_PIN, relayOn ? LOW : HIGH);
+    relayState = relayOn ? 1 : 0;
     int fsr = analogRead(FSR_PIN);
     int alcohol = analogRead(ALCOHOL_PIN);
 
-    // 형식: ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol\n  (master/TUI 그대로)
+    // 형식: ax,ay,az,gx,gy,gz,temp,light,fsr,alcohol,relayMode,relayState\n
     char line[96], tmp[12];
     dtostrf(sAx, 1, 3, line); strcat(line, ",");
     dtostrf(sAy, 1, 3, tmp); strcat(line, tmp); strcat(line, ",");
@@ -238,15 +265,14 @@ void loop() {
     dtostrf(temp, 1, 1, tmp); strcat(line, tmp); strcat(line, ",");
     itoa(light, tmp, 10); strcat(line, tmp); strcat(line, ",");
     itoa(fsr, tmp, 10); strcat(line, tmp); strcat(line, ",");
-    itoa(alcohol, tmp, 10); strcat(line, tmp);
+    itoa(alcohol, tmp, 10); strcat(line, tmp); strcat(line, ",");
+    itoa(relayMode, tmp, 10); strcat(line, tmp); strcat(line, ",");
+    itoa(relayState, tmp, 10); strcat(line, tmp);
 
     hc06.println(line);     // 블루투스로 송신
     Serial.print(line);     // 디버깅용
     Serial.print(F("   # sampling "));
     Serial.print(hz);
     Serial.println(F("Hz"));
-
-    // 마스터→슬레이브 명령 수신 (선택)
-    if (hc06.available()) Serial.write(hc06.read());
   }
 }

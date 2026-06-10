@@ -49,7 +49,11 @@ FIELDS = [
     "roll", "pitch", "gyroMag",
     "peakG", "peakForce",
     "impact",
+    "mode", "relay",
 ]
+
+# 릴레이 모드 코드 → 이름
+RELAY_MODE_NAMES = {0: "OFF", 1: "ON", 2: "AUTO"}
 
 # MQ-3 raw ADC 임계값 — 이 값 이상이면 음주 의심 (현장 보정 필요)
 ALCOHOL_THRESHOLD = 500
@@ -66,11 +70,6 @@ class State:
     port: str = ""
     frames: int = 0
     bad_lines: int = 0
-    # RFID
-    last_uid: str = ""
-    last_uid_time: float = 0.0
-    rfid_count: int = 0
-    rfid_log: deque = field(default_factory=lambda: deque(maxlen=10))
     lock: Lock = field(default_factory=Lock)
 
 
@@ -128,26 +127,6 @@ def _record_impact(peak_g, peak_f, impulse, dur_ms, jerk) -> None:
         state.impacts.appendleft((stamp, peak_g, peak_f, impulse, dur_ms, jerk))
 
 
-def parse_rfid(line: str) -> str | None:
-    """RFID,<UID_HEX> 라인을 파싱. UID 문자열(대문자) 또는 None."""
-    line = line.strip()
-    if not line.startswith("RFID,"):
-        return None
-    uid = line[5:].strip().upper()
-    if not uid or any(c not in "0123456789ABCDEF" for c in uid):
-        return None
-    return uid
-
-
-def _record_rfid(uid: str) -> None:
-    with state.lock:
-        state.last_uid = uid
-        state.last_uid_time = time.time()
-        state.rfid_count += 1
-        stamp = datetime.now().strftime("%H:%M:%S")
-        state.rfid_log.appendleft((stamp, uid))
-
-
 def reader_thread(port: str, baud: int) -> None:
     while True:
         try:
@@ -160,10 +139,6 @@ def reader_thread(port: str, baud: int) -> None:
                     if not raw:
                         continue
                     line = raw.decode("utf-8", errors="replace")
-                    uid = parse_rfid(line)
-                    if uid is not None:
-                        _record_rfid(uid)
-                        continue
                     ev = parse_impact(line)
                     if ev is not None:
                         _record_impact(*ev)
@@ -197,8 +172,6 @@ def demo_thread() -> None:
     peak_g = 0.0
     peak_f = 0.0
     next_impact = t0 + random.uniform(4, 8)
-    next_rfid = t0 + random.uniform(5, 10)
-    demo_uids = ["04A37B9F", "DEADBEEF", "12345678"]
     while True:
         t = time.time() - t0
         # 자연스러운 흔들림
@@ -248,6 +221,9 @@ def demo_thread() -> None:
             "roll": roll, "pitch": pitch, "gyroMag": gyro_mag,
             "peakG": peak_g, "peakForce": peak_f,
             "impact": impact,
+            # 데모: AUTO 모드 + 조도 기반 릴레이 (slave 로직과 동일)
+            "mode": 2.0,
+            "relay": 1.0 if light < 550 else 0.0,
         }
         with state.lock:
             state.last = data
@@ -261,9 +237,6 @@ def demo_thread() -> None:
                 state.impacts.appendleft(
                     (stamp, a_mag, force, force * 0.02, 20.0, jerk)
                 )
-        if time.time() >= next_rfid:
-            _record_rfid(random.choice(demo_uids))
-            next_rfid = time.time() + random.uniform(6, 12)
         time.sleep(0.1)
 
 
@@ -440,23 +413,12 @@ def status_panel(d) -> Panel:
             t.add_row("Alcohol", f"[{alc_color}]{int(alc):4d} ({alc_pct:5.1f}%)[/]")
         t.add_row("Peak |a|", f"[bold red]{d['peakG']:.3f} g[/]")
         t.add_row("Peak F",   f"[bold red]{d['peakForce']:.1f} N[/]")
-    with state.lock:
-        last_uid = state.last_uid
-        uid_time = state.last_uid_time
-        rfid_n = state.rfid_count
-    if last_uid:
-        age = time.time() - uid_time
-        if age < 3:
-            age_str = "[bold green]now[/]"
-        elif age < 60:
-            age_str = f"{age:.0f}s ago"
-        elif age < 3600:
-            age_str = f"{age/60:.0f}m ago"
-        else:
-            age_str = "long ago"
-        t.add_row("RFID", f"[bold green]{last_uid}[/] [dim]({age_str}, n={rfid_n})[/]")
-    else:
-        t.add_row("RFID", "[dim](no scan yet)[/]")
+        mode = int(d.get("mode", 2))
+        relay_on = int(d.get("relay", 0)) == 1
+        mode_name = RELAY_MODE_NAMES.get(mode, "?")
+        mode_color = "yellow" if mode == 2 else "green" if mode == 1 else "red"
+        relay_txt = "[bold green]● ON[/]" if relay_on else "[dim]○ OFF[/]"
+        t.add_row("Relay", f"[{mode_color}]{mode_name:<4}[/] {relay_txt}")
     return Panel(t, title="[bold]Status[/]", border_style="cyan")
 
 
